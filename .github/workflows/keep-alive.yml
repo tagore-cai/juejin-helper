@@ -1,0 +1,46 @@
+name: Keep Alive Workflow
+
+on:
+  schedule:
+    # 你可以根据需要调整这个 cron 表达式
+    # Cron 语法: 分 时 日 月 周
+    # '0 0 * * 0' # 每周日午夜 (UTC)
+    # '0 0 1 * *' # 每月1号午夜 (UTC)
+    # '0 3 * * *' # 每天凌晨3点 (UTC时间) 运行一次
+    - cron: '0 0 * * 0' # 每周日午夜 (UTC)
+  workflow_dispatch: # 允许手动触发此 workflow (方便测试)
+
+jobs:
+  keep_alive:
+    runs-on: ubuntu-latest
+    # 确保 workflow 有权限推送代码
+    permissions:
+      contents: write # 需要写入权限来推送 commit
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4 # 或者 @v3, @v2
+        with:
+          # 如果你的默认分支不是 main/master，或者你想在特定分支上创建空提交
+          # ref: 'your-default-branch-name'
+          # 通常，它会自动 checkout 仓库的默认分支
+          # 如果需要推送到受保护的分支，你可能需要更复杂的设置或使用 PAT
+          token: ${{ secrets.GITHUB_TOKEN }} # 使用内置的 GITHUB_TOKEN
+
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Create empty commit and push
+        run: |
+          git commit --allow-empty -m "chore: Keep-alive commit to prevent Actions disabling"
+          git push
+        # 如果你想推送到特定的远程分支，可以这样写：
+        # git push origin HEAD:refs/heads/main # 替换 main 为你的目标分支名
+        # 不过通常情况下，直接 `git push` 就会推送到当前 checkout 的分支
+
+      - name: Verify commit (optional)
+        run: |
+          echo "Last commit details:"
+          git log -1 --pretty=%B
