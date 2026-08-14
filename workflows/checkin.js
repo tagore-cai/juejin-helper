@@ -321,7 +321,11 @@ class CheckIn {
   username = "";
 
   constructor(cookie) {
-    this.cookie = cookie;
+    // 兼容多行/逗号/多余空格粘贴的Cookie, 统一规范为 "; " 分隔
+    this.cookie = cookie
+      .split(/[;,\s]+/)
+      .filter(Boolean)
+      .join("; ");
   }
 
   async run() {
