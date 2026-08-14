@@ -3,6 +3,83 @@ const JuejinHelper = require("juejin-helper");
 const utils = require("./utils/utils");
 const env = require("./utils/env");
 
+/**
+ * 掘金已对部分接口(check_in / lottery_config/get / lottery/draw)启用风控,
+ * 直接请求会返回空响应。需要在真实浏览器页面内发起请求,
+ * 由页面内的风控SDK(bdms)自动附加 msToken / a_bogus 等签名参数。
+ */
+
+/**
+ * 解析 __tea_cookie_tokens_* 中的 aid/uuid
+ * (npm 包 juejin-helper 1.7.2 内置的 parseCookieTokens 存在编译缺陷, 始终返回空值)
+ */
+function getCookieTokens(cookie) {
+  const tokens = { aid: "", uuid: "", user_unique_id: "", web_id: "" };
+  const tokensReg = /^__tea_cookie_tokens_(\d+)$/;
+  for (const [key, value] of cookie.split("; ").map(item => item.split("="))) {
+    if (tokensReg.test(key)) {
+      tokens.aid = key.match(tokensReg)[1];
+      const json = JSON.parse(decodeURIComponent(decodeURIComponent(value)));
+      tokens.uuid = json.user_unique_id;
+      tokens.user_unique_id = json.user_unique_id;
+      tokens.web_id = json.web_id;
+      break;
+    }
+  }
+  return tokens;
+}
+
+async function requestWithRiskControl(page, juejin, path, { method = "POST", body } = {}) {
+  const tokens = getCookieTokens(juejin.getCookie());
+  if (!tokens || !tokens.aid || !tokens.uuid) {
+    throw new Error("Cookie中缺少 __tea_cookie_tokens_* 参数, 请重新获取Cookie");
+  }
+  const url = `https://api.juejin.cn${path}?aid=${tokens.aid}&uuid=${tokens.uuid}`;
+
+  // 注意: 回调内不能使用 async/await, ts-node 会将其编译为依赖 __awaiter 的 ES5 代码,
+  // 而 __awaiter 在浏览器页面上下文中不存在
+  return page.evaluate(
+    ({ url, method, body }) => {
+      const waitFor = (fn, timeout = 20000) =>
+        new Promise((resolve, reject) => {
+          const start = Date.now();
+          const timer = setInterval(() => {
+            if (fn()) {
+              clearInterval(timer);
+              resolve();
+            } else if (Date.now() - start > timeout) {
+              clearInterval(timer);
+              reject(new Error("风控SDK加载超时"));
+            }
+          }, 200);
+        });
+
+      return waitFor(() => !!window.bdms).then(() => {
+        const request = fetch(url, {
+          method,
+          headers: { "content-type": "application/json" },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          credentials: "include"
+        })
+          .then(response => response.text())
+          .then(text => (text ? JSON.parse(text) : null));
+
+        const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("请求超时")), 30000));
+        return Promise.race([request, timeout]);
+      });
+    },
+    { url, method, body }
+  );
+}
+
+async function checkInWithRiskControl(page, juejin) {
+  const result = await requestWithRiskControl(page, juejin, "/growth_api/v1/check_in", { method: "POST", body: {} });
+  if (result && result.err_no) {
+    throw new Error(result.err_msg);
+  }
+  return result && result.data;
+}
+
 class Task {
   constructor(juejin) {
     this.juejin = juejin;
@@ -26,12 +103,12 @@ class GrowthTask extends Task {
   contCount = 0; // 连续签到天数
   sumCount = 0; // 累计签到天数
 
-  async run() {
+  async run(page) {
     const growth = this.juejin.growth();
 
     const todayStatus = await growth.getTodayStatus();
     if (!todayStatus) {
-      const checkInResult = await growth.checkIn();
+      const checkInResult = await checkInWithRiskControl(page, this.juejin);
 
       this.incrPoint = checkInResult.incr_point;
       this.sumPoint = checkInResult.sum_point;
@@ -111,10 +188,16 @@ class LotteriesTask extends Task {
   lotteryCount = 0;
   luckyValueProbability = 0;
 
-  async run(growthTask, dipLuckyTask) {
+  async run(growthTask, dipLuckyTask, page) {
     const growth = this.juejin.growth();
 
-    const lotteryConfig = await growth.getLotteryConfig();
+    const lotteryConfigResult = await requestWithRiskControl(page, this.juejin, "/growth_api/v1/lottery_config/get", {
+      method: "GET"
+    });
+    if (lotteryConfigResult && lotteryConfigResult.err_no) {
+      throw new Error(lotteryConfigResult.err_msg);
+    }
+    const lotteryConfig = lotteryConfigResult && lotteryConfigResult.data;
     this.lottery = lotteryConfig.lottery;
     this.pointCost = lotteryConfig.point_cost;
     this.freeCount = lotteryConfig.free_count;
@@ -122,7 +205,14 @@ class LotteriesTask extends Task {
 
     let freeCount = this.freeCount;
     while (freeCount > 0) {
-      const result = await growth.drawLottery();
+      const drawResult = await requestWithRiskControl(page, this.juejin, "/growth_api/v1/lottery/draw", {
+        method: "POST",
+        body: {}
+      });
+      if (drawResult && drawResult.err_no) {
+        throw new Error(drawResult.err_msg);
+      }
+      const result = drawResult && drawResult.data;
       this.drawLotteryHistory[result.lottery_id] = (this.drawLotteryHistory[result.lottery_id] || 0) + 1;
       dipLuckyTask.luckyValue = result.total_lucky_value;
       freeCount--;
@@ -254,14 +344,23 @@ class CheckIn {
 
     await this.mockVisitTask.run();
     await this.sdkTask.run();
-    console.log(`运行 ${this.growthTask.taskName}`);
-    await this.growthTask.run();
-    console.log(`运行 ${this.dipLuckyTask.taskName}`);
-    await this.dipLuckyTask.run();
-    console.log(`运行 ${this.lotteriesTask.taskName}`);
-    await this.lotteriesTask.run(this.growthTask, this.dipLuckyTask);
-    console.log(`运行 ${this.bugfixTask.taskName}`);
-    await this.bugfixTask.run();
+
+    const browser = juejin.browser();
+    await browser.open({ args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] });
+    const page = await browser.visitPage("/");
+
+    try {
+      console.log(`运行 ${this.growthTask.taskName}`);
+      await this.growthTask.run(page);
+      console.log(`运行 ${this.dipLuckyTask.taskName}`);
+      await this.dipLuckyTask.run();
+      console.log(`运行 ${this.lotteriesTask.taskName}`);
+      await this.lotteriesTask.run(this.growthTask, this.dipLuckyTask, page);
+      console.log(`运行 ${this.bugfixTask.taskName}`);
+      await this.bugfixTask.run();
+    } finally {
+      await browser.close();
+    }
     await juejin.logout();
     console.log("-------------------------");
 
@@ -351,6 +450,7 @@ async function run(args) {
 
 // 移除 catch 块中的 throw error
 run(process.argv.splice(2)).catch(error => {
+  console.error("Error: ", error);
   notification.pushMessage({
     title: "掘金每日签到",
     content: `<strong>Error</strong><pre>${error.message}</pre>`,
