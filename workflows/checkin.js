@@ -293,7 +293,7 @@ class MockVisitTask extends Task {
     console.log("--------模拟访问---------");
     try {
       const browser = this.juejin.browser();
-      await browser.open();
+      await browser.open({ args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] });
       try {
         await browser.visitPage("/");
         console.log("掘金首页：页面访问成功");
